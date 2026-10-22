@@ -1,0 +1,9 @@
+streamlit
+transformers
+torch
+sentence-transformers
+sentencepiece
+pandas
+numpy
+plotly
+pyarrow
