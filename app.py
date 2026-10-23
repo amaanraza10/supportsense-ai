@@ -1,3 +1,6 @@
+import gc
+import threading
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -7,11 +10,14 @@ st.set_page_config(page_title="SupportSense AI", layout="wide")
 st.title("SupportSense AI")
 st.caption("Multilingual (English / Hindi / Punjabi) customer support analytics. "
            "Demo data and ticket metadata are synthetic.")
-st.info("This hosted demo shows results precomputed by the project's fine-tuned models "
-        "(XLM-RoBERTa classifiers and LaBSE embeddings). Live analysis of a new message "
-        "runs in the Colab / local version of the project. See the GitHub repository for details.")
+st.info("The first tab runs the project's fine-tuned XLM-RoBERTa classifiers live on any message you type. "
+        "The other tabs show results precomputed by the same models (plus LaBSE embeddings). "
+        "See the [GitHub repository](https://github.com/amaanraza10/supportsense-ai) for details.")
 
 LANG_NAME = {"en": "English", "hi": "Hindi", "pa": "Punjabi"}
+HF_USER = "AmaanRaza01"          # the three models live at AmaanRaza01/{category,urgency,sentiment}-model
+TASKS = ["category", "urgency", "sentiment"]
+MAX_CHARS = 1000
 
 
 @st.cache_data
@@ -23,7 +29,175 @@ def load_data():
 
 
 df, emb = load_data()
-tab1, tab2, tab3, tab4 = st.tabs(["Explore a ticket", "Issue clusters", "Dashboard", "Search & export"])
+
+# Category -> team mapping and class lists, taken from the scored data so they always match the dashboard.
+ROUTE = df.groupby("pred_category")["route_to"].agg(lambda s: s.mode().iat[0]).to_dict()
+CLASSES = {
+    "category": sorted(df["pred_category"].unique()),
+    "urgency": sorted(df["pred_urgency"].unique()),
+    "sentiment": sorted(df["pred_sentiment"].unique()),
+}
+
+
+# ------------------------------------------------------------------ live analysis helpers
+@st.cache_resource
+def _model_lock():
+    """Only one analysis runs at a time, so two visitors cannot load models simultaneously
+    and push the free-tier server over its memory limit."""
+    return threading.Lock()
+
+
+def _hf_token():
+    try:
+        return st.secrets.get("HF_TOKEN")      # optional, only needed if the model repos are private
+    except Exception:
+        return None
+
+
+def detect_language(text):
+    """Cheap script-based guess: Gurmukhi -> Punjabi, Devanagari -> Hindi, otherwise English."""
+    gur = sum("\u0A00" <= ch <= "\u0A7F" for ch in text)
+    dev = sum("\u0900" <= ch <= "\u097F" for ch in text)
+    if gur == 0 and dev == 0:
+        return "en"
+    return "pa" if gur >= dev else "hi"
+
+
+def _label_names(model, task):
+    """Use the label names stored in the model config. If the config only has LABEL_0, LABEL_1, ...
+    fall back to the alphabetical class list from the data (the usual LabelEncoder order)."""
+    id2label = {int(k): v for k, v in model.config.id2label.items()}
+    generic = all(str(v).upper().startswith("LABEL_") for v in id2label.values())
+    classes = CLASSES[task]
+    if generic and len(classes) == len(id2label):
+        return {i: classes[i] for i in range(len(classes))}, True
+    return id2label, False
+
+
+def _classify_one(task, text):
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    repo = f"{HF_USER}/{task}-model"
+    token = _hf_token()
+    tok = AutoTokenizer.from_pretrained(repo, token=token)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        repo, token=token, low_cpu_mem_usage=True).eval()
+    try:
+        with torch.no_grad():
+            enc = tok(text, return_tensors="pt", truncation=True, max_length=128)
+            probs = torch.softmax(model(**enc).logits, dim=-1)[0]
+        k = int(probs.argmax())
+        names, guessed = _label_names(model, task)
+        return names[k], float(probs[k]), guessed
+    finally:
+        del model, tok                      # free memory before the next model loads
+        gc.collect()
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def analyze(text):
+    out = {}
+    with _model_lock():
+        for task in TASKS:
+            out[task] = _classify_one(task, text)
+    return out
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def embed_text(text):
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    with _model_lock():
+        try:
+            m = SentenceTransformer("sentence-transformers/LaBSE", device="cpu",
+                                    model_kwargs={"torch_dtype": torch.bfloat16})   # half the memory
+        except Exception:
+            m = SentenceTransformer("sentence-transformers/LaBSE", device="cpu")
+        try:
+            v = m.encode([text], convert_to_tensor=True, normalize_embeddings=True)
+            v = v.float().cpu().numpy()[0]
+        finally:
+            del m
+            gc.collect()
+    v = v.astype("float32")
+    return v / max(float(np.linalg.norm(v)), 1e-9)
+
+
+EXAMPLES = {
+    "(write my own)": "",
+    "English - delivery": "My order was supposed to arrive last week and it still has not shown up. Please help.",
+    "Hindi - delivery": "मेरा ऑर्डर पिछले हफ्ते आना था लेकिन अभी तक नहीं पहुँचा। कृपया मदद करें।",
+    "Punjabi - delivery": "ਮੇਰਾ ਆਰਡਰ ਪਿਛਲੇ ਹਫ਼ਤੇ ਆਉਣਾ ਸੀ ਪਰ ਹੁਣ ਤੱਕ ਨਹੀਂ ਪਹੁੰਚਿਆ। ਕਿਰਪਾ ਕਰਕੇ ਮਦਦ ਕਰੋ।",
+    "English - payment failed": "Money was deducted from my account but the payment shows as failed.",
+    "Hindi - account hacked": "मेरा अकाउंट हैक हो गया है और किसी ने मेरा पासवर्ड बदल दिया है।",
+    "Punjabi - rude agent": "ਤੁਹਾਡੇ ਸਪੋਰਟ ਏਜੰਟ ਨੇ ਮੇਰੇ ਨਾਲ ਬਦਤਮੀਜ਼ੀ ਨਾਲ ਗੱਲ ਕੀਤੀ।",
+}
+
+
+def _fill_example():
+    st.session_state["live_msg"] = EXAMPLES[st.session_state["live_example"]]
+
+
+st.session_state.setdefault("live_msg", "")
+
+tab0, tab1, tab2, tab3, tab4 = st.tabs(
+    ["Analyze a message", "Explore a ticket", "Issue clusters", "Dashboard", "Search & export"])
+
+# ---------------------------------------------------------------- Tab 0 (live analysis)
+with tab0:
+    st.write("Type a customer message in English, Hindi or Punjabi and the fine-tuned models will "
+             "predict its category, urgency and sentiment, and suggest which team should handle it.")
+    st.caption("The first analysis after the app wakes up downloads the models (a few minutes). "
+               "After that, each analysis takes roughly 10 to 30 seconds.")
+    st.selectbox("Try an example", list(EXAMPLES), key="live_example", on_change=_fill_example)
+    msg = st.text_area("Customer message", key="live_msg", height=120, max_chars=MAX_CHARS)
+    want_similar = st.checkbox("Also find the most similar tickets (loads LaBSE, slower)")
+
+    if st.button("Analyze", type="primary"):
+        text = msg.strip()
+        if not text:
+            st.warning("Enter a message first.")
+        else:
+            try:
+                with st.spinner("Running the models... the first run can take a few minutes."):
+                    res = analyze(text)
+                sim_table = None
+                if want_similar:
+                    with st.spinner("Finding similar tickets..."):
+                        v = embed_text(text)
+                    sims = emb @ v
+                    order = np.argsort(-sims)[:6]
+                    sim_table = df.loc[order, ["text", "language", "pred_category"]].copy()
+                    sim_table.insert(0, "similarity", np.round(sims[order], 2))
+                st.session_state["live_result"] = {"text": text, "res": res, "sim": sim_table}
+            except Exception as exc:                       # network, memory, or repo-name problems
+                st.session_state.pop("live_result", None)
+                st.error("Could not run the models. If this keeps happening, reboot the app from "
+                         "'Manage app' and try again.")
+                st.exception(exc)
+
+    shown = st.session_state.get("live_result")
+    if shown:
+        res = shown["res"]
+        cat, urg, sen = res["category"][0], res["urgency"][0], res["sentiment"][0]
+        st.markdown(f"**Message:** {shown['text']}")
+        m = st.columns(5)
+        m[0].metric("Language", LANG_NAME[detect_language(shown["text"])])
+        m[1].metric("Category", cat)
+        m[1].caption(f"{res['category'][1]:.0%} confidence")
+        m[2].metric("Sentiment", sen)
+        m[2].caption(f"{res['sentiment'][1]:.0%} confidence")
+        m[3].metric("Urgency", urg)
+        m[3].caption(f"{res['urgency'][1]:.0%} confidence")
+        m[4].metric("Route to", ROUTE.get(cat, "Support"))
+        if any(res[t][2] for t in TASKS):
+            st.caption("Label names were inferred from the training data's class order because the "
+                       "model configs only store numeric labels.")
+        if shown["sim"] is not None:
+            st.subheader("Most similar tickets (any language)")
+            st.dataframe(shown["sim"], hide_index=True)
 
 # ---------------------------------------------------------------- Tab 1
 with tab1:
@@ -104,8 +278,8 @@ with tab3:
         g1, g2 = st.columns(2)
         g1.plotly_chart(px.histogram(d, x="pred_category", color="pred_urgency",
                                      title="Urgency by category"))
-        res = d.groupby("pred_category")["resolution_hours"].mean().reset_index()
-        g2.plotly_chart(px.bar(res, x="pred_category", y="resolution_hours",
+        res_hours = d.groupby("pred_category")["resolution_hours"].mean().reset_index()
+        g2.plotly_chart(px.bar(res_hours, x="pred_category", y="resolution_hours",
                                title="Average resolution time (hours)"))
 
         g3, g4 = st.columns(2)
