@@ -1,0 +1,20 @@
+name: keep-alive
+ 
+on:
+  schedule:
+    - cron: "0 */8 * * *"      # every 8 hours (Streamlit sleeps apps after about 12 hours without visitors)
+  workflow_dispatch:            # lets you run it by hand from the Actions tab
+ 
+jobs:
+  visit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install playwright && playwright install --with-deps chromium
+      - run: python keepalive.py
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+ 
